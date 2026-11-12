@@ -1,0 +1,7 @@
+[package]
+version = "0.1.0"
+name = { en = "Operate the niri desktop", zh = "操作 niri 桌面" }
+summary = { en = "A skill for clicking, typing and reading GUI apps on the shorin-niri desktop in the background", zh = "一份技能：在后台点、输入、读 shorin-niri 桌面上的图形界面应用" }
+author = "SHORiN-KiWATA"
+upstream = "https://github.com/SHORiN-KiWATA/miyu-skills-shorin-niri-use"
+icon = "mouse-pointer-click"
