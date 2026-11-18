@@ -8,11 +8,13 @@
 # 加载后先断言脚本的 HOME 在临时目录下——绝不碰真实的 ~/.mozilla。
 # 放在 .github/tests/ 而不是 tests/：打包会跳过 .github，测试不会进包。
 
+import errno
 import hashlib
 import importlib.machinery
 import importlib.util
 import os
 import pathlib
+import shutil
 import sqlite3
 import struct
 import sys
@@ -330,6 +332,152 @@ class StaleLoginFiles(Sandbox):
                 if has_files:
                     self.assertEqual((dst / "storage" / "default" / "site" / "ls.sqlite").read_bytes(), b"x")
                     self.assertTrue((dst / "key4.db").is_file())
+
+
+def snap(path):
+    """一个文件或目录的快照：文件看大小、mtime_ns、sha256；目录看整树（tree）。"""
+    if path.is_dir():
+        return ("dir", os.lstat(path).st_mtime_ns, tree(path))
+    st = os.lstat(path)
+    return ("file", st.st_size, st.st_mtime_ns, hashlib.sha256(path.read_bytes()).hexdigest())
+
+
+def plain_db(path):
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE t (x)")
+    db.execute("INSERT INTO t VALUES ('source')")
+    db.commit()
+    db.close()
+
+
+class AgentSideLinks(Sandbox):
+    # 审计收尾：往 agent 侧写的地方，目标名字是符号链接时会顺着链接写到 agent 目录外：
+    # PLAIN_FILES 的 shutil.copy2、user.js 的 write_text 写进链接指的文件；storage 是链接时
+    # rsync --delete 写进链接指的目录、把那里原有的东西删掉；copy_sqlite 的 shutil.move
+    # 在同一个文件系统上 rename 会换掉链接本身，但跨文件系统（/tmp 是 tmpfs、家目录在别的盘，
+    # 真机上就是这样）时退回 copy2，写进链接指的文件；链接指的是目录时 move 把库挪进那个目录。
+    # 应先删掉链接本身再写：链接指的东西一个字节不变，agent 侧那个名字成了普通文件/目录、内容是源的。
+
+    def outside(self):
+        out = self.base / "outside"
+        (out / "dir").mkdir(parents=True)
+        (out / "dir" / "keep").write_bytes(b"target dir content")
+        (out / "pdir").mkdir()
+        (out / "pdir" / "keep").write_bytes(b"target dir content")
+        for name in ("logins.json", "user.js", "key4.db", "cookies.sqlite",
+                     "key4.db-wal", "key4.db-shm", "key4.db-journal"):
+            (out / name).write_bytes(b"target " + name.encode())
+        return out
+
+    def source(self):
+        src = self.profile("src", lz4_file(COOKIES))
+        cookie_db(src / "cookies.sqlite", ["fresh.example"])
+        for name in ("key4.db", "permissions.sqlite"):
+            plain_db(src / name)
+        (src / "logins.json").write_text("source logins")
+        (src / "storage" / "default" / "site").mkdir(parents=True)
+        (src / "storage" / "default" / "site" / "ls.sqlite").write_bytes(b"source site")
+        return src
+
+    def linked_agent(self, out):
+        dst = self.base / "agent"
+        dst.mkdir()
+        links = {"logins.json": out / "logins.json", "user.js": out / "user.js",
+                 "key4.db": out / "key4.db", "cookies.sqlite": out / "cookies.sqlite",
+                 "key4.db-wal": out / "key4.db-wal", "key4.db-shm": out / "key4.db-shm",
+                 "key4.db-journal": out / "key4.db-journal",
+                 "permissions.sqlite": out / "pdir", "storage": out / "dir"}
+        for name, target in links.items():
+            (dst / name).symlink_to(target, target_is_directory=target.is_dir())
+        return dst
+
+    def targets(self, out):
+        return {p.name: snap(p) for p in sorted(out.iterdir())}
+
+    def check_agent(self, dst):
+        for name in ("logins.json", "user.js", "key4.db", "cookies.sqlite", "permissions.sqlite"):
+            with self.subTest(agent=name):
+                self.assertFalse((dst / name).is_symlink(), f"agent 侧的 {name} 还是链接")
+                self.assertTrue((dst / name).is_file(), f"agent 侧的 {name} 不是普通文件")
+        for name in ("key4.db-wal", "key4.db-shm", "key4.db-journal"):
+            with self.subTest(agent=name):
+                self.assertFalse(os.path.lexists(dst / name), f"agent 侧的 {name} 还在")
+        self.assertEqual((dst / "logins.json").read_text(), "source logins")
+        self.assertEqual((dst / "user.js").read_text(), self.mod.USER_JS)
+        for name in ("key4.db", "permissions.sqlite"):
+            db = sqlite3.connect(dst / name)
+            self.assertEqual(db.execute("SELECT x FROM t").fetchall(), [("source",)], name)
+            db.close()
+        db = sqlite3.connect(dst / "cookies.sqlite")
+        hosts = sorted(r[0] for r in db.execute("SELECT host FROM moz_cookies"))
+        db.close()
+        self.assertEqual(hosts, ["a.example", "fresh.example"], "会话 cookie 该加进 agent 自己的库")
+
+    def run_sync(self, cross_device):
+        out = self.outside()
+        src = self.source()
+        dst = self.linked_agent(out)
+        before = self.targets(out)
+        source_before = tree(src)
+        real_rename = os.rename
+
+        def rename(a, b, *args, **kw):
+            # 跨文件系统：从 agent-firefox 的临时目录挪出来时 rename 失败，shutil.move 退回拷贝。
+            if cross_device and "agent-firefox-" in str(a):
+                raise OSError(errno.EXDEV, "Invalid cross-device link")
+            return real_rename(a, b, *args, **kw)
+
+        with mock.patch("os.rename", rename):
+            self.mod.sync(src, dst)
+        self.assertEqual(self.targets(out), before, "链接指向的东西被改了")
+        self.assertEqual(tree(src), source_before, "源 profile 被改了")
+        self.check_agent(dst)
+        self.assertEqual((dst / "storage" / "default" / "site" / "ls.sqlite").read_bytes(), b"source site")
+        self.assertFalse((dst / "storage").is_symlink())
+
+    @unittest.skipUnless(shutil.which("rsync"), "本机没有 rsync")
+    def test_links_not_followed_same_filesystem(self):
+        self.run_sync(cross_device=False)
+
+    @unittest.skipUnless(shutil.which("rsync"), "本机没有 rsync")
+    def test_links_not_followed_cross_filesystem(self):
+        self.run_sync(cross_device=True)
+
+    # rsync 换成桩：调 rsync 的那一刻 agent 侧的 storage 已经不是链接。
+    def test_storage_link_gone_before_rsync(self):
+        out = self.outside()
+        src = self.source()
+        dst = self.linked_agent(out)
+        before = snap(out / "dir")
+        seen = []
+
+        def run(cmd, **kw):
+            if cmd[0] == "rsync":
+                seen.append(os.path.islink(dst / "storage"))
+            return mock.Mock(returncode=0)
+
+        with mock.patch.object(self.mod.subprocess, "run", run):
+            self.mod.sync(src, dst)
+        self.assertEqual(seen, [False], "调 rsync 时 agent 侧的 storage 还是链接（或没调 rsync）")
+        self.assertEqual(snap(out / "dir"), before)
+
+    # 防改坏（现在就绿）：storage/ 里更深一层的链接 rsync 自己不跟（没带 --keep-dirlinks）：
+    # 源也有的那项，链接被换成目录；源没有的，--delete 只删链接本身。
+    @unittest.skipUnless(shutil.which("rsync"), "本机没有 rsync")
+    def test_deeper_storage_links_not_followed(self):
+        out = self.outside()
+        src = self.source()
+        dst = self.base / "agent"
+        (dst / "storage" / "default").mkdir(parents=True)
+        (dst / "storage" / "default" / "site").symlink_to(out / "dir", target_is_directory=True)
+        (dst / "storage" / "default" / "gone").symlink_to(out / "pdir", target_is_directory=True)
+        before = self.targets(out)
+        self.mod.sync(src, dst)
+        self.assertEqual(self.targets(out), before, "链接指向的目录被改了")
+        site = dst / "storage" / "default" / "site"
+        self.assertFalse(site.is_symlink())
+        self.assertEqual((site / "ls.sqlite").read_bytes(), b"source site")
+        self.assertFalse(os.path.lexists(dst / "storage" / "default" / "gone"))
 
 
 if __name__ == "__main__":
