@@ -137,20 +137,30 @@ def lz4_block(src, size):
         length = token >> 4
         if length == 15:
             while True:
+                if i >= n:
+                    raise ValueError("bad lz4 data")
                 b = src[i]
                 i += 1
                 length += b
                 if b != 255:
                     break
+        if i + length > n:
+            raise ValueError("bad lz4 data")
         out += src[i : i + length]
         i += length
         if i >= n:
             break
+        if i + 2 > n:
+            raise ValueError("bad lz4 data")
         offset = src[i] | (src[i + 1] << 8)
         i += 2
+        if offset == 0 or offset > len(out):
+            raise ValueError("bad lz4 data")
         length = token & 15
         if length == 15:
             while True:
+                if i >= n:
+                    raise ValueError("bad lz4 data")
                 b = src[i]
                 i += 1
                 length += b
@@ -178,7 +188,7 @@ def session_cookies(profile):
                 continue
             size = struct.unpack("<I", data[8:12])[0]
             return json.loads(lz4_block(data[12:], size)).get("cookies", [])
-        except (OSError, ValueError, json.JSONDecodeError):
+        except (OSError, ValueError, json.JSONDecodeError, struct.error):
             continue
     return []
 
@@ -202,11 +212,15 @@ def origin_attributes(attrs):
 
 def add_session_cookies(db_path, cookies):
     """Stores session cookies as cookies that last a day, so the agent's Firefox loads them."""
-    if not cookies:
-        return 0
+    if not cookies or not db_path.is_file():
+        return 0                # no cookie database to add to; Firefox makes one on first start
     now_us = int(time.time() * 1_000_000)
     expiry_ms = int((time.time() + 86400) * 1000)
     db = sqlite3.connect(db_path)
+    table = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'moz_cookies'"
+    if not db.execute(table).fetchone():
+        db.close()
+        return 0
     rows = []
     for c in cookies:
         rows.append(
