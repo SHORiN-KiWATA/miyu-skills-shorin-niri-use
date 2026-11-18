@@ -325,6 +325,10 @@ def main():
     args = parser.parse_args()
 
     agent = args.profile
+    # A profile folder that is a symlink is fine (kept on another disk); one that points nowhere is not.
+    if agent.is_symlink() and not agent.exists():
+        die(f"{agent} is a symlink to {os.readlink(agent)}, which does not exist: "
+            "create that folder or remove the link")
     running = is_running(agent)
     if not running and not args.no_sync:
         source = args.source or default_profile()
