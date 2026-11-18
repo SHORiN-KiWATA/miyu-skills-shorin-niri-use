@@ -108,5 +108,46 @@ class BrokenSessionStore(Sandbox):
                          b"AAAAA")
 
 
+class RsyncDependency(Sandbox):
+    # 审计 #184-1：源 profile 有 storage/ 时 sync 硬调 rsync（check=True），没装 rsync 就
+    # FileNotFoundError；README「要什么」和 SKILL.md 都没写 rsync。修法二选一：文档写上 rsync，
+    # 或改用 shutil.copytree 不再依赖它。文档没写时，PATH 里没有 rsync 也得同步得了。
+    def test_rsync_documented_or_not_needed(self):
+        root = SCRIPT.parents[2]
+        docs = (root / "README.md").read_text(encoding="utf-8") + \
+            (SCRIPT.parent / "SKILL.md").read_text(encoding="utf-8")
+        if "rsync" in docs:
+            return
+        src = self.profile("src")
+        (src / "storage" / "default" / "site").mkdir(parents=True)
+        (src / "storage" / "default" / "site" / "ls.sqlite").write_bytes(b"x")
+        dst = self.base / "agent"
+        empty = self.base / "empty-bin"
+        empty.mkdir()
+        with mock.patch.dict(os.environ, {"PATH": str(empty)}):
+            self.mod.sync(src, dst)
+        self.assertEqual((dst / "storage" / "default" / "site" / "ls.sqlite").read_bytes(), b"x")
+
+
+class LockPid(Sandbox):
+    # 审计 #184-2：is_running 只看 lock 链接里的 pid 在 /proc 下存不存在。pid 被别的进程
+    # 复用（这里 pid 1 是 init）或者链接写的是别的主机，也当成 agent 的 Firefox 在跑，
+    # 于是跳过登录同步、给 firefox 加 --new-window。应核对进程确实是 firefox（主机名对不上
+    # 也当作没在跑）。
+    def test_lock_pointing_at_non_firefox_pid_is_not_running(self):
+        for target in ("otherhost:+1", f"{os.uname().nodename}:+1", f"{os.uname().nodename}:+{os.getpid()}"):
+            with self.subTest(lock=target):
+                p = self.base / ("prof-" + str(abs(hash(target))))
+                p.mkdir()
+                os.symlink(target, p / "lock")
+                self.assertFalse(self.mod.is_running(p))
+
+    # 防改坏（现在就绿）：没有 lock 就是没在跑。
+    def test_no_lock_is_not_running(self):
+        p = self.base / "prof"
+        p.mkdir()
+        self.assertFalse(self.mod.is_running(p))
+
+
 if __name__ == "__main__":
     unittest.main()
