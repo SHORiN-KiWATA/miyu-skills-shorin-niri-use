@@ -28,10 +28,16 @@ import os
 import subprocess
 import sys
 
-import gi
+# Without PyGObject, --help still works; main() says what is missing.
+try:
+    import gi
 
-gi.require_version("Atspi", "2.0")
-from gi.repository import Atspi  # noqa: E402
+    gi.require_version("Atspi", "2.0")
+    from gi.repository import Atspi  # noqa: E402
+except (ImportError, ValueError) as exc:
+    Atspi, ATSPI_ERROR = None, exc
+else:
+    ATSPI_ERROR = None
 
 NIRI = os.environ.get("NIRI", "niri")
 
@@ -49,12 +55,13 @@ CONTAINERS = {
     "page tab list", "list", "table", "tree", "tree table", "redundant object", "unknown",
     "document frame", "document web", "form", "landmark", "block quote", "article",
 }
+# Labels and the Atspi.StateType names they stand for.
 STATES = [
-    ("checked", Atspi.StateType.CHECKED),
-    ("selected", Atspi.StateType.SELECTED),
-    ("pressed", Atspi.StateType.PRESSED),
-    ("expanded", Atspi.StateType.EXPANDED),
-    ("focused", Atspi.StateType.FOCUSED),
+    ("checked", "CHECKED"),
+    ("selected", "SELECTED"),
+    ("pressed", "PRESSED"),
+    ("expanded", "EXPANDED"),
+    ("focused", "FOCUSED"),
 ]
 MAX_NODES = 20000
 
@@ -139,6 +146,11 @@ def main():
     parser.add_argument("--offscreen", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    if Atspi is None:
+        sys.exit(
+            f"agent-ui needs PyGObject and AT-SPI ({ATSPI_ERROR}); "
+            "python3 -c \"import gi; gi.require_version('Atspi', '2.0')\" must work"
+        )
 
     info = niri_info(args.id)
     pid = info.get("pid")
@@ -187,12 +199,16 @@ def main():
     count = 0
     lines = []
 
-    def emit(obj, role, name, rect, origin, depth, div):
+    def emit(obj, role, name, ss, rect, origin, depth, div):
         x, y, rw, rh = (v / div for v in rect)
         cx = round(x + rw / 2 - origin[0], 1)
         cy = round(y + rh / 2 - origin[1], 1)
         rw, rh = round(rw), round(rh)
-        states = [label for label, st in STATES if obj.get_state_set().contains(st)]
+        # The state set walk() already has: asking again fails if the node vanished meanwhile.
+        try:
+            states = [label for label, st in STATES if ss.contains(getattr(Atspi.StateType, st))]
+        except Exception:
+            states = []
         # Scrolled out of view: listed so that the caller knows to scroll, not to click there.
         if cy < 0:
             states.append("offscreen above")
@@ -201,7 +217,6 @@ def main():
         elif cx < 0 or cx > w:
             states.append("offscreen")
         try:
-            ss = obj.get_state_set()
             if not ss.contains(Atspi.StateType.ENABLED) and role in INTERACTIVE:
                 states.append("disabled")
         except Exception:
@@ -274,7 +289,7 @@ def main():
             or role == "static" and name
         )
         if listed:
-            emit(obj, role, name, rect, origin, depth, div)
+            emit(obj, role, name, ss, rect, origin, depth, div)
 
         # Nothing interesting below a text field or a link, besides its text.
         if role in ("entry", "password text", "link") and not args.all:
