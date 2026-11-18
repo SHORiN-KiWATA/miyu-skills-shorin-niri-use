@@ -263,6 +263,10 @@ def add_session_cookies(db_path, cookies):
 
 def sync(source, agent):
     agent.mkdir(parents=True, exist_ok=True)
+    if not (source / "cookies.sqlite").exists():
+        # Replaced whole each time: with none in the source, the cookies from the last sync go too.
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            (agent / f"cookies.sqlite{suffix}").unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="agent-firefox-") as tmp:
         tmp = Path(tmp)
         for name in SQLITE_FILES:
