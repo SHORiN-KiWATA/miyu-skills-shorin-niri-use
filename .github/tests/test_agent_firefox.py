@@ -8,6 +8,7 @@
 # 加载后先断言脚本的 HOME 在临时目录下——绝不碰真实的 ~/.mozilla。
 # 放在 .github/tests/ 而不是 tests/：打包会跳过 .github，测试不会进包。
 
+import hashlib
 import importlib.machinery
 import importlib.util
 import os
@@ -212,6 +213,123 @@ class StaleAgentCookies(Sandbox):
         self.assertEqual((dst / "cookies.sqlite").read_bytes(), before)
         self.assertFalse((dst / "user.js").exists(), "在跑时不该同步")
         self.assertIn("--new-window", run.call_args.args[0])
+
+
+def tree(root):
+    """整树快照：每一项的类型；文件的大小、mtime、内容哈希；链接指向哪儿。"""
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in sorted(dirnames + filenames):
+            p = pathlib.Path(dirpath) / name
+            st = os.lstat(p)
+            rel = str(p.relative_to(root))
+            if p.is_symlink():
+                out[rel] = ("link", os.readlink(p))
+            elif p.is_dir():
+                out[rel] = ("dir",)
+            else:
+                out[rel] = ("file", st.st_size, st.st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest())
+    return out
+
+
+class StaleLoginFiles(Sandbox):
+    # 审计收尾（#183 顺带发现，合并人定了扩大）：文件头说登录状态「每次整份替换」，但源 profile
+    # 没有 key4.db、permissions.sqlite、logins.json、logins-backup.json、containers.json
+    # （SQLITE_FILES、PLAIN_FILES 两张表里的）时，agent 侧上次同步来的那份留着：用户清掉的已存
+    # 密码，agent 那边还解得开。源没有 storage/ 时 agent 侧旧的 storage/（网站数据）也留着
+    # （rsync 带 --delete，但源没有 storage/ 时根本不调 rsync）。
+    # 源没有的，agent 侧的那份（sqlite 连同 -wal、-shm、-journal）应删掉；只删表里的名字、只删
+    # agent 侧目录里的；是符号链接的只删链接本身；源那边一个字节不碰；agent 自己的文件不碰。
+    SUFFIXES = ("", "-wal", "-shm", "-journal")
+
+    def synced_names(self):
+        sqlite_files, plain = self.mod.SQLITE_FILES, self.mod.PLAIN_FILES
+        for name in ("cookies.sqlite", "key4.db", "permissions.sqlite"):
+            self.assertIn(name, sqlite_files)
+        for name in ("logins.json", "logins-backup.json", "containers.json"):
+            self.assertIn(name, plain)
+        return [n + x for n in sqlite_files for x in self.SUFFIXES] + list(plain)
+
+    def stale_agent(self, name="agent"):
+        dst = self.base / name
+        (dst / "storage" / "default" / "https+++old.example" / "ls").mkdir(parents=True)
+        (dst / "storage" / "default" / "https+++old.example" / "ls" / "data.sqlite").write_bytes(b"old site")
+        for name in self.synced_names():
+            (dst / name).write_bytes(b"stale from last sync")
+        return dst
+
+    def test_files_missing_in_source_removed_from_agent(self):
+        src = self.profile("src")
+        dst = self.stale_agent()
+        self.mod.sync(src, dst)
+        for name in self.synced_names() + ["storage"]:
+            with self.subTest(name=name):
+                self.assertFalse(os.path.lexists(dst / name), f"源没有 {name}，agent 侧上次同步来的还留着")
+        self.assertTrue((dst / "user.js").is_file(), "同步没走完")
+
+    # 防改坏（现在就绿）：agent 侧不是同步来的文件都留着。
+    def test_agent_own_files_kept(self):
+        # Firefox 自己建的、名字和同步的那几个像的，都不是同步来的，一个不许删。
+        own = ["prefs.js", "places.sqlite", "places.sqlite-wal", "formhistory.sqlite", "key4.db.bak",
+               "logins.json~", "cookies.sqlite.corrupt", "storage.sqlite", "extensions/a.xpi",
+               "storage-sync-v2.sqlite"]
+        for has_source in (False, True):
+            with self.subTest(source_has_files=has_source):
+                src = self.profile(f"src-{has_source}")
+                if has_source:
+                    cookie_db(src / "cookies.sqlite", ["fresh.example"])
+                    (src / "logins.json").write_text("{}")
+                    (src / "prefs.js").write_text("source prefs")
+                dst = self.base / f"agent-{has_source}"
+                for name in own:
+                    (dst / name).parent.mkdir(parents=True, exist_ok=True)
+                    (dst / name).write_text("agent's own " + name)
+                self.mod.sync(src, dst)
+                for name in own:
+                    self.assertEqual((dst / name).read_text(), "agent's own " + name, name)
+
+    def test_symlink_in_agent_only_link_removed(self):
+        outside = self.base / "outside"
+        (outside / "site").mkdir(parents=True)
+        (outside / "key4.db").write_bytes(b"target file")
+        (outside / "site" / "data").write_bytes(b"target dir content")
+        dst = self.base / "agent"
+        dst.mkdir()
+        (dst / "key4.db").symlink_to(outside / "key4.db")
+        (dst / "logins.json").symlink_to(outside / "key4.db")
+        (dst / "storage").symlink_to(outside / "site", target_is_directory=True)
+        self.mod.sync(self.profile("src"), dst)
+        for name in ("key4.db", "logins.json", "storage"):
+            with self.subTest(name=name):
+                self.assertFalse(os.path.lexists(dst / name), f"agent 侧的链接 {name} 还在")
+        self.assertEqual((outside / "key4.db").read_bytes(), b"target file", "链接指向的文件被删/改了")
+        self.assertEqual((outside / "site" / "data").read_bytes(), b"target dir content",
+                         "链接指向的目录被删/改了")
+
+    # 防改坏（现在就绿）：同步前后源 profile 整树一样（源里有那些文件、没有两种）。
+    def test_source_profile_untouched(self):
+        for has_files in (False, True):
+            with self.subTest(source_has_files=has_files):
+                src = self.profile(f"src-{has_files}", lz4_file(COOKIES))
+                if has_files:
+                    cookie_db(src / "cookies.sqlite", ["fresh.example"])
+                    for name in ("key4.db", "permissions.sqlite"):
+                        db = sqlite3.connect(src / name)
+                        db.execute("CREATE TABLE t (x)")
+                        db.commit()
+                        db.close()
+                    for name in self.mod.PLAIN_FILES:
+                        (src / name).write_text("{}")
+                    (src / "storage" / "default" / "site").mkdir(parents=True)
+                    (src / "storage" / "default" / "site" / "ls.sqlite").write_bytes(b"x")
+                    (src / "prefs.js").write_text("source prefs")
+                dst = self.stale_agent(f"agent-{has_files}")
+                before = tree(src)
+                self.mod.sync(src, dst)
+                self.assertEqual(tree(src), before, "源 profile 被改了")
+                if has_files:
+                    self.assertEqual((dst / "storage" / "default" / "site" / "ls.sqlite").read_bytes(), b"x")
+                    self.assertTrue((dst / "key4.db").is_file())
 
 
 if __name__ == "__main__":
