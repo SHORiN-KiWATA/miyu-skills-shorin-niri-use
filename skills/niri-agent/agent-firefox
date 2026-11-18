@@ -102,6 +102,13 @@ def is_running(profile):
             or os.path.basename(argv0).startswith(b"firefox"))
 
 
+def no_link(path):
+    """Before writing a name of the agent's profile: a symlink there goes itself, so the write stays
+    in the profile instead of following it."""
+    if path.is_symlink():
+        path.unlink()
+
+
 def copy_sqlite(src, dst, tmp):
     """Copies a database that Firefox may be writing, with its write-ahead log.
 
@@ -131,6 +138,7 @@ def copy_sqlite(src, dst, tmp):
         if ok:
             for suffix in ("-wal", "-shm", "-journal"):
                 dst.with_name(dst.name + suffix).unlink(missing_ok=True)
+            no_link(dst)        # across file systems move copies, and a copy follows a link
             shutil.move(copy, dst)
             return
         time.sleep(0.2)
@@ -282,6 +290,7 @@ def sync(source, agent):
                     drop(agent / f"{name}{suffix}")
         for name in PLAIN_FILES:
             if (source / name).exists():
+                no_link(agent / name)
                 shutil.copy2(source / name, agent / name)
             else:
                 drop(agent / name)
@@ -290,6 +299,7 @@ def sync(source, agent):
 
     # Site storage; the per-site caches are big and not needed for logins.
     if (source / "storage").is_dir():
+        no_link(agent / "storage")
         subprocess.run(
             [
                 "rsync", "-a", "--delete",
@@ -301,6 +311,7 @@ def sync(source, agent):
     else:
         drop(agent / "storage")
 
+    no_link(agent / "user.js")
     (agent / "user.js").write_text(USER_JS)
     return cookies
 
