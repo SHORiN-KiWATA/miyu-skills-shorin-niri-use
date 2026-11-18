@@ -149,5 +149,70 @@ class LockPid(Sandbox):
         self.assertFalse(self.mod.is_running(p))
 
 
+def cookie_db(path, hosts):
+    """造一份带 moz_cookies 表的 cookies.sqlite（列照 add_session_cookies 要写的那些）。"""
+    db = sqlite3.connect(path)
+    db.execute("CREATE TABLE moz_cookies (id INTEGER PRIMARY KEY, originAttributes TEXT, name TEXT,"
+               " value TEXT, host TEXT, path TEXT, expiry INTEGER, lastAccessed INTEGER,"
+               " creationTime INTEGER, isSecure INTEGER, isHttpOnly INTEGER, sameSite INTEGER,"
+               " schemeMap INTEGER, isPartitionedAttributeSet INTEGER, updateTime INTEGER,"
+               " UNIQUE (name, host, path, originAttributes))")
+    db.executemany("INSERT INTO moz_cookies (originAttributes, name, value, host, path) VALUES ('', 'old', '1', ?, '/')",
+                   [(h,) for h in hosts])
+    db.commit()
+    db.close()
+
+
+class StaleAgentCookies(Sandbox):
+    # 审计收尾（#183 顺带发现）：文件头说登录状态「每次整份替换」，但源 profile 没有
+    # cookies.sqlite 时 copy_sqlite 直接 return，agent 那边上次同步来的 cookies.sqlite
+    # （连同 -wal、-shm）原样留着：用户已经清掉的登录态，agent 的 Firefox 还登着；
+    # 会话 cookie 还被加进这份旧库。应删掉 agent 侧的这几个文件，会话 cookie 没库可加就跳过。
+    def test_source_without_cookies_db_clears_agent_copy(self):
+        src = self.profile("src", lz4_file(COOKIES))
+        dst = self.base / "agent"
+        dst.mkdir()
+        cookie_db(dst / "cookies.sqlite", ["stale.example"])
+        (dst / "cookies.sqlite-wal").write_bytes(b"old wal")
+        (dst / "cookies.sqlite-shm").write_bytes(b"old shm")
+        n = self.mod.sync(src, dst)
+        for name in ("cookies.sqlite", "cookies.sqlite-wal", "cookies.sqlite-shm"):
+            with self.subTest(name=name):
+                self.assertFalse((dst / name).exists(), f"源没有 cookies.sqlite，agent 侧的 {name} 还留着")
+        self.assertEqual(n, 0, "没有 cookie 库时会话 cookie 应跳过")
+        self.assertTrue((dst / "user.js").is_file(), "同步没走完")
+
+    # 防改坏（现在就绿）：源有 cookies.sqlite 时照旧整份替换，再加会话 cookie。
+    def test_source_with_cookies_db_replaces_agent_copy(self):
+        src = self.profile("src", lz4_file(COOKIES))
+        cookie_db(src / "cookies.sqlite", ["fresh.example"])
+        dst = self.base / "agent"
+        dst.mkdir()
+        cookie_db(dst / "cookies.sqlite", ["stale.example"])
+        self.assertEqual(self.mod.sync(src, dst), 1)
+        db = sqlite3.connect(dst / "cookies.sqlite")
+        hosts = sorted(r[0] for r in db.execute("SELECT host FROM moz_cookies"))
+        db.close()
+        self.assertEqual(hosts, ["a.example", "fresh.example"])
+
+    # 防改坏（现在就绿）：agent 的 Firefox 在跑时整个不同步，它正在用的 cookies.sqlite 不动。
+    def test_running_agent_firefox_skips_sync(self):
+        src = self.profile("src")
+        dst = self.base / "agent"
+        dst.mkdir()
+        cookie_db(dst / "cookies.sqlite", ["stale.example"])
+        before = (dst / "cookies.sqlite").read_bytes()
+        argv = ["agent-firefox", "--source", str(src), "--profile", str(dst)]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(self.mod, "is_running", return_value=True), \
+                mock.patch.object(self.mod.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
+                mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit):
+                self.mod.main()
+        self.assertEqual((dst / "cookies.sqlite").read_bytes(), before)
+        self.assertFalse((dst / "user.js").exists(), "在跑时不该同步")
+        self.assertIn("--new-window", run.call_args.args[0])
+
+
 if __name__ == "__main__":
     unittest.main()
