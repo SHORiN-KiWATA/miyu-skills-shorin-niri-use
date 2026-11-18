@@ -87,9 +87,18 @@ def is_running(profile):
         target = os.readlink(lock)
     except OSError:
         return False
-    # The link reads "host:+pid".
+    # The link reads "host:+pid". A pid that is gone, or now belongs to another program, is a
+    # stale lock left by a Firefox that didn't exit cleanly.
     pid = target.rpartition("+")[2]
-    return pid.isdigit() and Path(f"/proc/{pid}").exists()
+    if not pid.isdigit():
+        return False
+    try:
+        comm = Path(f"/proc/{pid}/comm").read_text().strip()
+        argv0 = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[0]
+    except OSError:
+        return False
+    return (comm.startswith("firefox") or comm == "GeckoMain"
+            or os.path.basename(argv0).startswith(b"firefox"))
 
 
 def copy_sqlite(src, dst, tmp):

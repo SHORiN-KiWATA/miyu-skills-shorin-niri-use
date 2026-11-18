@@ -13,6 +13,7 @@ miyu pkg install shorin-niri-use
 
 - **[SHORiN-KiWATA/niri](https://github.com/SHORiN-KiWATA/niri)**：`niri msg agent`（agent seat，第二套指针和键盘）是这个分支加的，
   官方 niri 没有，装了也用不上。
+- `agent-firefox` 同步网站数据（`storage/`）要 `rsync`。
 - `agent-ui`（读窗口的无障碍树）要 PyGObject 和 AT-SPI：`python3 -c "import gi; gi.require_version('Atspi', '2.0')"` 不报错就行。
 - Miyu 核心要从桌面会话里起（拿得到 niri 的套接字和会话的 D-Bus）。
 
