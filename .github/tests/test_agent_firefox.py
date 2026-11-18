@@ -12,6 +12,7 @@ import errno
 import hashlib
 import importlib.machinery
 import importlib.util
+import io
 import os
 import pathlib
 import shutil
@@ -478,6 +479,53 @@ class AgentSideLinks(Sandbox):
         self.assertFalse(site.is_symlink())
         self.assertEqual((site / "ls.sqlite").read_bytes(), b"source site")
         self.assertFalse(os.path.lexists(dst / "storage" / "default" / "gone"))
+
+
+class DanglingProfileLink(Sandbox):
+    # 审计收尾：agent 的 profile 目录本身是符号链接是允许的（有人把它放到别的盘）。但链接指向的
+    # 目录不存在时，mkdir(exist_ok=True) 抛 FileExistsError、打 traceback。应说清是哪个链接、
+    # 指向哪儿、该怎么办，退出码 1，不起 Firefox，也不替人去建链接指向的目录。
+    def test_dangling_profile_link_friendly_error(self):
+        src = self.profile("src")
+        target = self.base / "elsewhere" / "profile"
+        dst = self.base / "agent"
+        dst.symlink_to(target)
+        argv = ["agent-firefox", "--source", str(src), "--profile", str(dst)]
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(self.mod.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
+                mock.patch("sys.stderr", err):
+            try:
+                self.mod.main()
+                code = 0
+            except SystemExit as exc:
+                code = exc.code
+            except OSError as exc:
+                self.fail(f"悬空链接时抛了 {type(exc).__name__}: {exc}")
+        self.assertEqual(code, 1, err.getvalue())
+        self.assertIn(str(dst), err.getvalue())
+        self.assertIn(str(target), err.getvalue())
+        run.assert_not_called()
+        self.assertTrue(dst.is_symlink(), "链接本身不动")
+        self.assertFalse(target.exists(), "不替人建链接指向的目录")
+
+    # 防改坏（现在就绿）：链接指向一个在的目录时照常同步，写进链接指的目录。
+    def test_profile_link_to_existing_folder_still_works(self):
+        src = self.profile("src")
+        target = self.base / "elsewhere"
+        target.mkdir()
+        dst = self.base / "agent"
+        dst.symlink_to(target)
+        argv = ["agent-firefox", "--source", str(src), "--profile", str(dst)]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(self.mod.subprocess, "run", return_value=mock.Mock(returncode=0)) as run, \
+                mock.patch("sys.stderr"):
+            with self.assertRaises(SystemExit) as done:
+                self.mod.main()
+        self.assertEqual(done.exception.code, 0)
+        self.assertTrue((target / "user.js").is_file())
+        self.assertTrue(dst.is_symlink())
+        run.assert_called_once()
 
 
 if __name__ == "__main__":
