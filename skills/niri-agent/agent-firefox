@@ -34,7 +34,8 @@ HOME = Path.home()
 AGENT_PROFILE = HOME / ".local/share/niri-agent/firefox"
 FIREFOX_DIR = HOME / ".mozilla/firefox"
 
-# Login state: copied whole each time, replacing the agent's version.
+# Login state: copied whole each time, replacing the agent's version; one the source doesn't have
+# is removed from the agent's profile (with a database's -wal, -shm and -journal).
 PLAIN_FILES = ["logins.json", "logins-backup.json", "containers.json"]
 SQLITE_FILES = ["cookies.sqlite", "key4.db", "permissions.sqlite"]
 
@@ -261,19 +262,29 @@ def add_session_cookies(db_path, cookies):
     return len(rows)
 
 
+def drop(path):
+    """Removes a file or folder of the agent's profile. A symlink goes itself, not what it points to."""
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
 def sync(source, agent):
     agent.mkdir(parents=True, exist_ok=True)
-    if not (source / "cookies.sqlite").exists():
-        # Replaced whole each time: with none in the source, the cookies from the last sync go too.
-        for suffix in ("", "-wal", "-shm", "-journal"):
-            (agent / f"cookies.sqlite{suffix}").unlink(missing_ok=True)
     with tempfile.TemporaryDirectory(prefix="agent-firefox-") as tmp:
         tmp = Path(tmp)
         for name in SQLITE_FILES:
-            copy_sqlite(source / name, agent / name, tmp)
+            if (source / name).exists():
+                copy_sqlite(source / name, agent / name, tmp)
+            else:
+                for suffix in ("", "-wal", "-shm", "-journal"):
+                    drop(agent / f"{name}{suffix}")
         for name in PLAIN_FILES:
             if (source / name).exists():
                 shutil.copy2(source / name, agent / name)
+            else:
+                drop(agent / name)
 
     cookies = add_session_cookies(agent / "cookies.sqlite", session_cookies(source))
 
@@ -287,6 +298,8 @@ def sync(source, agent):
             ],
             check=True,
         )
+    else:
+        drop(agent / "storage")
 
     (agent / "user.js").write_text(USER_JS)
     return cookies
